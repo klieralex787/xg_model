@@ -1,0 +1,824 @@
+---
+title: "xG Model Using XGBoost"
+output: 
+  html_document:
+    keep_md: TRUE
+---
+### Objective:
+
+Build an xG Model for soccer and analyze results using SHAP values
+
+* With xG Model we get an estimate of how likely shot is to be a goal, and it can be used to evaluate teams/player performances.
+
+* From an XGBoost GBM we lose interpretability, and we can use SHAP values to understand how the model uses certain features to generate predictions.
+
+```{r setup, echo = FALSE, warning = FALSE, message = FALSE}
+## -----------------
+## package setup
+## -----------------
+library(tidyverse)
+library(devtools)
+library(StatsBombR)
+library(SDMTools)
+library(remotes)
+library(xgboost)
+library(SHAPforxgboost)
+library(tidyr)
+library(forcats)
+library(vip)
+library(caret)
+library(kableExtra)
+library(shapviz)
+library(pROC)
+
+# set printing options to remove exponents
+options(scipen=999)
+```
+
+## Obtaining the Data
+The data used was from StatsBomb Match Events, where data for some matches are provided for free.
+The StatsBombR package was used to extract and load the data for all these matches:
+(http://statsbomb.com/wp-content/uploads/2019/12/Using-StatsBomb-Data-In-R.pdf)
+
+```{r read_in_data}
+# read in events using the StatsBombR package
+StatsBombData <- StatsBombFreeEvents()
+
+# filter to shots
+shots <- StatsBombData %>%
+  filter(type.name == "Shot")
+
+# filter to passes
+passes <- StatsBombData %>%
+  filter(type.name == "Pass")
+
+# select relevant features for passes and rename for join to shots data
+passes <- passes %>%
+  select(id, location, pass.length, pass.angle, pass.end_location, pass.switch,pass.aerial_won, 
+         pass.through_ball, pass.inswinging, pass.straight, pass.cross, pass.outswinging, 
+         pass.cut_back, pass.deflected, pass.height.name, pass.body_part.name, pass.type.name) %>%
+  rename("shot.key_pass_id" = "id",
+         "pass_location" = "location")
+
+# select relevant features for shots
+shots_modeling <- shots %>%
+  select(id, period, related_events, location, under_pressure, play_pattern.name, position.name, 
+         shot.statsbomb_xg, shot.freeze_frame, shot.key_pass_id, shot.first_time, shot.aerial_won, 
+         shot.technique.name, shot.body_part.id, shot.type.name, shot.outcome.name, competition_id,
+         season_id)
+
+# join pass and shot data
+shots_modeling <- shots_modeling %>%
+  left_join(passes, by = "shot.key_pass_id")
+```
+
+## Feature Creation for xG Model
+
+In order to increase the predictive power of the xG Model, I have created a few features that I believe will be useful in determining the xG of a shot. 
+
+#### Convert Location Into X and Y Coordinates
+
+```{r create_features}
+# split shot location feature coordinates into new features
+# extract the x and y coordinates from the original location feature
+# turn them into their own variables for each
+shots_modeling <- shots_modeling %>%
+  mutate(location_x = str_extract(as.character(location), "[0-9]+.?[0-9]?,"),
+         location_y = str_extract(as.character(location), "[0-9]+.?[0-9]?\\)"),
+         location_x_shot = str_sub(location_x, 0, nchar(location_x) - 1),
+         location_y_shot = str_sub(location_y, 0, nchar(location_y) - 1),
+         location_x_pass = str_extract(as.character(pass_location), "[0-9]+.?[0-9]?,"),
+         location_y_pass = str_extract(as.character(pass_location), "[0-9]+.?[0-9]?\\)"),
+         location_x_pass = str_sub(location_x_pass, 0, nchar(location_x_pass) - 1),
+         location_y_pass = str_sub(location_y_pass, 0, nchar(location_y_pass) - 1))
+
+```
+
+#### Distance to Goal
+
+From the x and y coordinates, we can calculate the distance to the center of the goal using
+the pythagorean theorem (in which the hypotenuse is the shot distance). The coordinates were referenced against page 34 on the StatsBomb documentation: https://github.com/statsbomb/open-data/blob/master/doc/StatsBomb%20Open%20Data%20Specification%20v1.1.pdf
+
+```{r distance_to_goal, warning=FALSE}
+# create distance to goal 
+shots_modeling <- shots_modeling %>%
+  mutate(location_x_shot = as.numeric(location_x_shot),
+         location_y_shot = as.numeric(location_y_shot),
+         # the goals are located at the 0 and 120 coordinates for X,
+         # and 40 for the Y coordinates
+         goal_1_x = 0,
+         goal_1_y = 40,
+         goal_2_x = 120,
+         goal_2_y = 40,
+         # calculate the distance between the coordinates of the shots and the goals
+         x_distance_goal_1 = abs(location_x_shot - goal_1_x),
+         y_distance_goal_1 = abs(location_y_shot - goal_1_y),
+         x_distance_goal_2 = abs(location_x_shot - goal_2_x),
+         y_distance_goal_2 = abs(location_y_shot - goal_2_y))
+
+# find nearest goal
+shots_modeling <- shots_modeling %>%
+  group_by(id) %>%
+  mutate(x_shot_distance = min(x_distance_goal_1, x_distance_goal_2),
+         # find the distance between the x coordinate and the nearest goal
+         # this assumes that a player is shooting at the goal that is in the half
+         # of the field that the shot was taken in
+         y_shot_distance = y_distance_goal_1,
+         # the y coordinate distance will be the same for both, as both goals are at 40
+         shot_distance = sqrt((x_shot_distance ^ 2) + (y_shot_distance ^ 2))) 
+         # use the pythagorean theorem to find the distance of the shot based
+         # on the x and y coordinates
+         # Note: this calculates the distance to the center of the goal, which
+         # rarely is where the shot is actually directed, but is useful for 
+         # estimating the distance of the shot
+
+# remove vars that are not useful for modeling
+remove_shot_vars <-c("x_shot_distance", "y_shot_distance", "goal_1_x", "goal_1_y",
+                      "goal_2_x", "goal_2_y", "x_distance_goal_1", "x_distance_goal_2",
+                      "y_distance_goal_1", "y_distance_goal_2", "location_x", "location_y", 
+                      "location", "pass_location")
+
+shots_modeling <- shots_modeling %>%
+  select(-remove_shot_vars)
+```
+
+#### Pass Location
+
+Using the end location of the pass prior to the shot, we can extract more contextual information
+about the shot -- if the player took the shot a long distance away from the end pass location, we
+know they must have been responsible for the movement and creation leading up to the shot. If the
+pass ends close to the shot location, we know that information about the pass likely had a larger 
+influence on the shot, and potentially its goal probability.
+
+```{r create_more_features, warning=FALSE}
+# split location feature coordinates into new features
+# extract the x and y coordinates from the original location feature
+# turn them into their own variables for each
+shots_modeling <- shots_modeling %>%
+  mutate(pass_end_x = str_extract(as.character(pass.end_location), "[0-9]+.?[0-9]?,"),
+         pass_end_y = str_extract(as.character(pass.end_location), "[0-9]+.?[0-9]?\\)"),
+         pass_end_x = str_sub(pass_end_x, 0, nchar(pass_end_x) - 1),
+         pass_end_y = str_sub(pass_end_y, 0, nchar(pass_end_y) - 1))
+#,
+shots_modeling <- shots_modeling %>%
+  mutate(pass_end_x = as.numeric(pass_end_x),
+         pass_end_y = as.numeric(pass_end_y),
+         pass_end_x = replace_na(pass_end_x, location_x_shot),
+         pass_end_y = replace_na(pass_end_y, location_y_shot),
+         pass_end_x = as.numeric(pass_end_x),
+         pass_end_y = as.numeric(pass_end_y),
+         # calculate the distance between the pass and the shot
+         shot_pass_diff_x = as.numeric(abs(location_x_shot - pass_end_x)),
+         shot_pass_diff_y = as.numeric(abs(location_y_shot - pass_end_y)),
+         shot_pass_diff = shot_pass_diff_x + shot_pass_diff_y)
+
+# remove additional unnecessary features
+other_remove_vars <- c("related_events", "shot.statsbomb_xg", "shot.freeze_frame",
+                       "shot.key_pass_id", "competition_id", "season_id", "pass_end_x", 
+                       "pass_end_y", "shot_pass_diff_x", "shot_pass_diff_y", "pass.end_location")
+
+shots_modeling <- shots_modeling %>%
+  select(-other_remove_vars)
+```
+
+#### Convert Position Feature
+
+The original data about position players has lots of levels. I have collapsed similar position levels
+to relative groups. This will help the model pick up on differences in shots from attackers versus 
+defenders for example, compared to a right back versus a right wing back. 
+
+```{r position, results="asis"}
+# count of shots by each individual position name 
+positions <- as.data.frame(table(shots_modeling$position.name))
+positions %>%
+  rename("Position" = "Var1") %>%
+  kableExtra::kbl() %>%
+  kableExtra::kable_paper()
+
+# group positions into useful categories 
+attacker <- c("Secondary Striker", "Right Wing", "Left Wing", "Center Forward", 
+              "Left Center Forwrd", "Right Center Forward")
+midfielder <- c("Center Attacking Midfield", "Center Defensive Midfield", "Center Midfield",
+                "Left Attacking Midfield", "Left Center Midfield", "Left Defensive Midfield",
+                "Left Midfield", "Right Attacking Midfield", "Right Center Midfield", 
+                "Right Defensive Midfield", "Right Midfield")
+defender <- c("Center Back", "Left Back", "Left Center Back", "Left Wing Back",
+              "Right Back", "Right Center Back", "Right Wing Back")
+goalkeeper <- c("Goalkeeper")
+
+# update modeling set
+shots_modeling <- shots_modeling %>%
+  mutate(attacker = ifelse(position.name %in% attacker, 1, 0),
+         midfielder = ifelse(position.name %in% midfielder, 1, 0),
+         defender = ifelse(position.name %in% defender, 1, 0),
+         goalkeeper = ifelse(position.name %in% goalkeeper, 1, 0)) %>%
+  select(-position.name)
+```
+
+#### Convert Shot Body Part Feature
+```{r body_part}
+# convert shot body part from numeric to categorical
+shots_modeling <- shots_modeling %>%
+  mutate(shot.body_part.id = ifelse(shot.body_part.id == 37, "Head", 
+                             ifelse(shot.body_part.id == 38, "Left_Foot",
+                             ifelse(shot.body_part.id == 40, "Right_Foot", "Other"))))
+```
+
+
+#### Convert Feature Values
+
+Some features come in one-hot encoding format from the original StatsBomb data. However they are 
+listed as True/False, and the model needs this to be converted to binary (1,0) 
+
+```{r create_modeling_dataset}
+# convert one-hot variables from TRUE/FALSE to binary format
+shots_modeling <- shots_modeling %>%
+  mutate(under_pressure = ifelse(under_pressure == TRUE, 1, 0),
+         shot.first_time = ifelse(shot.first_time == TRUE, 1, 0),
+         shot.aerial_won = ifelse(shot.aerial_won == TRUE, 1, 0),
+         pass.switch = ifelse(pass.switch == 1, 0),
+         pass.aerial_won = ifelse(pass.aerial_won == TRUE, 1, 0),
+         pass.through_ball = ifelse(pass.through_ball == TRUE, 1, 0),
+         pass.inswinging = ifelse(pass.inswinging == TRUE, 1, 0),
+         pass.straight = ifelse(pass.straight == TRUE, 1, 0),
+         pass.cross = ifelse(pass.cross == TRUE, 1, 0),
+         pass.outswinging = ifelse(pass.outswinging == TRUE, 1, 0),
+         pass.cut_back = ifelse(pass.cut_back == TRUE, 1, 0),
+         pass.deflected = ifelse(pass.deflected == TRUE, 1, 0))
+
+# replace NA values with 0 for relevant features
+shots_modeling <- shots_modeling %>%
+  mutate(under_pressure = replace_na(under_pressure, 0),
+         shot.first_time = replace_na(shot.first_time, 0),
+         shot.aerial_won = replace_na(shot.aerial_won, 0))
+
+# convert target variable to binary format
+shots_modeling <- shots_modeling %>%
+  mutate(label = ifelse(shot.outcome.name == "Goal", 1, 0)) %>%
+  select(-shot.outcome.name)
+
+# convert features to numeric
+shots_modeling <- shots_modeling %>%
+  mutate(location_x_pass = as.numeric(location_x_pass),
+         location_y_pass = as.numeric(location_y_pass)) %>%
+  ungroup() %>%
+  select(-id)
+
+# print out structure of final modeling dataset
+str(shots_modeling)
+target <- as.data.frame(table(shots_modeling$label))
+
+# print out target frequency
+target %>%
+  rename("Target" = "Var1") %>%
+  kbl() %>%
+  kable_paper(full_width = F)
+```
+
+## Building XGBoost GBM Model
+
+As we are constructing an xG model, we want to build the model off of the training set, and have
+a holdout set to test the model performance against. The code below splits the data into 70% 
+training and 30% test, and preps it into the correct format for feeding into an XGBoost model. 
+
+
+#### Data Prep for XGBoost
+
+```{r prep_for_modeling}
+# create own dataset for label
+shots_label <- shots_modeling %>%
+  select(label)
+
+# remove target from dataset
+shots_modeling_set <- shots_modeling %>%
+  select(-label)
+
+# create training and test set index (70/30)
+shots_index <- createDataPartition(shots_modeling$label, 
+                                   p = 0.7,
+                                   list = FALSE)
+
+# create one-hot encoded variables for categorical features
+shots_dummy <- dummyVars(" ~ .", data = shots_modeling_set)
+shots_dummy_df <- predict(shots_dummy, shots_modeling_set)
+
+# split data into training and test set
+shots_training <- shots_dummy_df[shots_index,]
+shots_test <- shots_dummy_df[-shots_index,]
+
+# split label into training and test set
+shots_training_label <- shots_label[shots_index,]
+shots_test_label <- shots_label[-shots_index,]
+
+# convert into xgb DMatrix format
+dtrain <- xgb.DMatrix(shots_training, label = shots_training_label$label)
+dtest <- xgb.DMatrix(shots_test, label = shots_test_label$label)
+
+# combine train and test for watchlist
+watchlist <- list(train = dtrain, test = dtest)
+```
+
+#### Cross Validation for Hyperparameters
+
+To find the optimal XGBoost hyperparameters for the xG Model, I ran a 5-fold CV on the training set.
+Each CV run splits the training data into 5 equal 'folds' -- then a model is built off of 4 of the
+folds, and its performance is tested against the one remaining fold. This is completed until the 
+AUC on the test fold doesn't improve in 10 rounds. This is used to find the optimal number of trees,
+and report an maximum AUC value to compare the sets of hyperparameter combinations.
+
+```{r cross_validation}
+# create list of parameters for grid search 
+params_1 <- list(objective = "binary:logistic", eval_metric = "error", eval_metric = "auc", 
+                 verbose = 2, max_depth = 3, eta = 0.1)
+params_2 <- list(objective = "binary:logistic", eval_metric = "error", eval_metric = "auc", 
+                 verbose = 2, max_depth = 3, eta = 0.05)
+params_3 <- list(objective = "binary:logistic", eval_metric = "error", eval_metric = "auc", 
+                 verbose = 2, max_depth = 3, eta = 0.025)
+params_4 <- list(objective = "binary:logistic", eval_metric = "error", eval_metric = "auc", 
+                 verbose = 2, max_depth = 5, eta = 0.1)
+params_5 <- list(objective = "binary:logistic", eval_metric = "error", eval_metric = "auc", 
+                 verbose = 2, max_depth = 5, eta = 0.05)
+params_6 <- list(objective = "binary:logistic", eval_metric = "error", eval_metric = "auc", 
+                 verbose = 2, max_depth = 5, eta = 0.025)
+params_7 <- list(objective = "binary:logistic", eval_metric = "error", eval_metric = "auc",
+                 verbose = 2, max_depth = 7, eta = 0.1)
+params_8 <- list(objective = "binary:logistic", eval_metric = "error", eval_metric = "auc",
+                 verbose = 2, max_depth = 7, eta = 0.05)
+params_9 <- list(objective = "binary:logistic", eval_metric = "error", eval_metric = "auc",
+                 verbose = 2, max_depth = 7, eta = 0.025)
+
+# cross-validation runs on training to find optimal hyperparameter set
+cv_1 <- xgb.cv(params = params_1, early_stopping_rounds = 10, nrounds = 1000, 
+               data = dtrain, nfold = 5, verbose = 0)
+cv_2 <- xgb.cv(params = params_2, early_stopping_rounds = 10, nrounds = 1000, 
+               data = dtrain, nfold = 5, verbose = 0)
+cv_3 <- xgb.cv(params = params_3, early_stopping_rounds = 10, nrounds = 1000, 
+               data = dtrain, nfold = 5, verbose = 0)
+cv_4 <- xgb.cv(params = params_4, early_stopping_rounds = 10, nrounds = 1000, 
+               data = dtrain, nfold = 5, verbose = 0)
+cv_5 <- xgb.cv(params = params_5, early_stopping_rounds = 10, nrounds = 1000, 
+               data = dtrain, nfold = 5, verbose = 0)
+cv_6 <- xgb.cv(params = params_6, early_stopping_rounds = 10, nrounds = 1000, 
+               data = dtrain, nfold = 5, verbose = 0)
+cv_7 <- xgb.cv(params = params_7, early_stopping_rounds = 10, nrounds = 1000, 
+               data = dtrain, nfold = 5, verbose = 0)
+cv_8 <- xgb.cv(params = params_8, early_stopping_rounds = 10, nrounds = 1000, 
+               data = dtrain, nfold = 5, verbose = 0)
+cv_9 <- xgb.cv(params = params_9, early_stopping_rounds = 10, nrounds = 1000, 
+               data = dtrain, nfold = 5, verbose = 0)
+
+# find max of cv test AUC 
+print(paste0("Max AUC of cv 1: ",max(cv_1$evaluation_log$test_auc_mean)))
+print(paste0("Max AUC of cv 2: ",max(cv_2$evaluation_log$test_auc_mean)))
+print(paste0("Max AUC of cv 3: ",max(cv_3$evaluation_log$test_auc_mean)))
+print(paste0("Max AUC of cv 4: ",max(cv_4$evaluation_log$test_auc_mean)))
+print(paste0("Max AUC of cv 5: ",max(cv_5$evaluation_log$test_auc_mean)))
+print(paste0("Max AUC of cv 6: ",max(cv_6$evaluation_log$test_auc_mean)))
+print(paste0("Max AUC of cv 7: ",max(cv_7$evaluation_log$test_auc_mean)))
+print(paste0("Max AUC of cv 8: ",max(cv_8$evaluation_log$test_auc_mean)))
+print(paste0("Max AUC of cv 9: ",max(cv_9$evaluation_log$test_auc_mean)))
+```
+
+We use AUC as the evaluation metric for this model as it emphasizes ranking - we want to be able to better rank shots that are more likely to be a goal, compared to those that are not.
+
+#### Model Build
+
+We want to build the XGBoost model with the optimal number of trees as determined by the CV:
+
+```{r model_build_parameters4}
+# highest is parameter list 1 
+print(paste("Optimal number of trees from CV:", cv_6$niter - 10))
+ntrees = cv_1$niter - 10
+```
+
+The optimal parameters came from CV set 1: those were then used to construct an XGBoost model.
+
+```{r model_build, warning = FALSE}
+# rebuild model with optimal parameters
+model_1 <- xgb.train(data = dtrain, nrounds = ntrees, params = params_6, watchlist = watchlist, verbose = 0)
+```
+
+We want to check that the model performance is similar on the test set and the cross-validation:
+
+```{r model_auc}
+print(paste0("Holdout Set AUC: ", max(model_1$evaluation_log$test_auc)))
+print(paste0("CV Set AUC: ", max(cv_6$evaluation_log$test_auc_mean)))
+```
+
+#### Model Performance
+
+As the goal probability is the most important metric in the xG model evaluation, we can look at the model shot xG distributions to see if they follow an expected pattern. We expect to see a 
+distributions skewed right with the majority of shots having a low probability of being a goal, and a small number with a high probability.
+
+```{r model_performance}
+# get predictions for all shots taken
+predictions <- as.data.frame(predict(model_1, shots_dummy_df))
+
+predictions <- cbind(predictions, shots_label)
+
+predictions <- predictions %>%
+  mutate(prediction = `predict(model_1, shots_dummy_df)`) %>%
+  mutate(predicted_value = as.factor(ifelse(prediction > 0.5, 1, 0)),
+         label = as.factor(label))
+
+# plot density distribution of xG
+ggplot(data = predictions) + 
+  geom_density(aes(x = prediction), color = "black", fill = "grey", alpha = 0.5) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, .1)) + 
+  labs(title = "Density of xG Distributions",
+       subtitle = "Scores From All Shot Data",
+       x = "xG",
+       y = "Density") + 
+  theme_minimal()
+
+# plot histogram of xG
+ggplot(data = predictions) + 
+  geom_histogram(aes(x = prediction), binwidth = .1, color = "black", fill = "blue") +
+  scale_x_continuous(limits = c(-.05, 1.05), breaks = seq(0, 1, 0.1)) + 
+  labs(title = "Histogram of xG Distributions",
+       subtitle = "Scores From All Shot Data",
+       x = "xG",
+       y = "Shot Count") + 
+  theme_minimal()
+```
+
+If our model performs well, we would expect it to be able to associate shots with a high xG with actual goals, and shots with a low xG with non-goals. To validate this, we can break out the xG values by goals and non-goals.
+
+```{r model_performance_sep}
+# create separate datasets for positive and negative predictions from the model
+positives <- predictions %>%
+  filter(predicted_value == 1)
+negatives <- predictions %>%
+  filter(predicted_value == 0)
+
+# convert binary label to interpretation for plotting
+predictions <- predictions %>%
+  mutate(pred_value = ifelse(label == 1, "Goal","No Goal"))
+ggplot() + 
+  geom_density(aes(x = prediction, group=pred_value, fill = pred_value), color = "black", alpha = 0.5, data = predictions) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, .1)) + 
+  labs(title = "Density of xG Distributions",
+       subtitle = "Scores From All Shot Data",
+       x = "xG",
+       y = "Density") + 
+  theme_minimal()
+```
+
+We can see from the distributions that the model associates the majority of non-goals with low xG values (< 0.3), while the majority of larger xG values (> 0.3) are associated with shots resulting in goals. This tells us that the model is performing reasonably well at identifying shots that resulted in goals, and associating higher xG values with shots that resulted in goals. 
+
+## Feature Importance of GBM Model
+
+After constructing the xG Model, we want to understand what features are deemed 'important'. As the model is a GBM, there is a less clear view of what the model is using to create predictions 
+compared to a GLM.
+
+* Gain - Measures the average error decrease when splitting on a feature. This metric is biased 
+         towards features that are split on further down in the tree, and gives them more credit.
+         
+* Permutation - Measures the model error increase when a feature is permuted, or modified. While a 
+                more reliable importance measure, it can run into issues with correlated features,
+                as well as changing feature values to represent unrealistic values.
+
+* SHAP - Measures the individual contribution that each feature provides to a single prediction. 
+
+#### Gain
+
+```{r gain}
+# take top 10 features with highest gain
+importance <- xgb.importance(model = model_1)
+importance <- importance %>%
+  select(Feature, Gain) %>%
+  head(10)
+
+# plot Gain Feature Importance
+ggplot(data = importance) + 
+  geom_bar(aes(x = Gain, y = fct_reorder(Feature, Gain), fill = Gain), stat = "identity") + 
+  theme_minimal() + 
+  theme(legend.position = "none") + 
+  labs(title = "Feature Importance: Gain Metric",
+       subtitle = "For Top 10 Features",
+       x = "Gain",
+       y = "")
+```
+
+#### Permutation Importance
+
+```{r permutation_importance}
+# calculate permutation importance
+model_perm_imp <- vip(object = model_1, method = "permute", target = shots_training_label, 
+                      nsim = 5, train = shots_training, metric = "auc", 
+                      pred_wrapper = predict, reference_class = 1)
+
+perm_data <- model_perm_imp$data
+
+# plot permutation importance
+ggplot(data = perm_data) + 
+  geom_bar(aes(x = Importance, y = fct_reorder(Variable, Importance), fill = Importance), 
+           stat = "identity") + 
+  theme_minimal() + 
+  theme(legend.position = "none") + 
+  labs(title = "Feature Importance: Permutation",
+       subtitle = "For Top 10 Features",
+       x = "Importance",
+       y = "")
+```
+
+#### SHAP Values 
+
+More details on SHAP value calculations can be found here: https://christophm.github.io/interpretable-ml-book/shap.html
+
+```{r overall_shap_values}
+# calculate SHAP values for top 10 features
+shots_long <- shap.prep(xgb_model = model_1, X_train = shots_dummy_df, top_n = 10)
+
+# convert missing values to binary so plot has correct colors for shot open play feature
+shots_long$rfvalue <- replace_na(shots_long$rfvalue, 0)
+shots_long <- shots_long %>%
+  mutate(stdfvalue = coalesce(stdfvalue, rfvalue))
+
+# plot SHAP values 
+shap.plot.summary(shots_long)
+
+```
+
+From these feature importance plots, we are looking for a few things.
+
+First, we see that all three measures of importance generally line up, which gives us more confidence in our understanding of what features the model is picking up on, and what is generally more useful for making predictions. All three measures of importance deem the shot_distance as the most important feature, so we can be reasonably confident that this is a useful predictor. Open Play shots, location_x and location_y, as well as Through Ball passes are also consistently high on the importance list.
+
+What differentiates SHAP from the first two importance measures is the ability to dig deeper with importance explanations. In permutation importance and gain, we understand how important a feature is relative to the others - but not what the feature does to make it important - questions such as are higher/lower values more predictive, and what is the spread across all values compared to just the average? These are questions that SHAP values allow us to answer. The summary plot above plots the feature value and the SHAP importance for each data point used, so we can not only see the spread of values across features relative to the average, but also if a high/low feature value has a varying impact.
+
+#### SHAP Dependence Plots
+
+With SHAP dependence plots we can drill deeper than the summary plot into individual features we find to be of high importance. These plots show the feature values on the X axis, and the SHAP importance on the y axis, showing us the impact of the feature value on importance.
+
+```{r shap_dependence_distance, message=FALSE}
+# Shot Distance 
+shap.plot.dependence(data_long = shots_long, x = 'shot_distance', y = 'shot_distance', 
+                     color_feature = 'shot_distance') 
+```
+
+From the overall SHAP plot the shot_distance feature was deemed the most important. As expected, this plot demonstrates that shots taken closer to the goal have higher SHAP values, meaning they contribute positively to the predictions. 
+
+We can also use this plot to define certain cutoffs - shots from 5 yards or less have the highest contribution to the overall prediction, shots from 5-15 yards still contribute positively, and shots from further than 15 yards start to decrease the overall predicted xG value.
+
+```{r shap_dependence_y, message=FALSE}
+# Shot Y Coordinate Location
+shap.plot.dependence(data_long = shots_long, x = 'location_y_shot', y = 'location_y_shot', color_feature = 'location_y_shot') + 
+  geom_vline(xintercept = 36, color = "black") + 
+  geom_vline(xintercept = 44, color = "black")
+```
+
+We can also look more specifically at the Y coordinate from where the shot was taken. The black vertical lines in the plot above represent the coordinates for the goal posts. As we can see, shots taken within the goal posts contribute to a higher xG than shots taken outside the goal posts. 
+
+```{r shap_dependence_open_play, warning=FALSE, message=FALSE}
+# Shot Type Open Play
+shap.plot.dependence(data_long = shots_long, x = "pass.through_ball", y = "pass.through_ball", color_feature = "pass.through_ball")
+```
+
+SHAP dependence plots can also be used on binary features. This plot tells us that passes that are through balls contribute to a higher xG. However, we also see that there is a wide range on these, ranging from 0.25 to just under 1. We can interpret this as we are confident that through ball passes contribute to a higher xG, however due to the spread we are not very confident as to how much exactly the feature contributes.
+
+#### Local SHAP Prediction
+
+```{r local_shap_prediction}
+# create a shapviz object
+shp <- shapviz(model_1, X_pred = data.matrix(shots_dummy_df), X = shots_dummy_df)
+
+# plot an individual waterfall plot
+sv_waterfall(shp, row_id = 1)
+
+# filter to the first row of data to show data values
+individual_data <- shots_dummy_df %>%
+  head(1)
+
+individual_data %>%
+  kbl() %>%
+  kable_paper() %>%
+  scroll_box(width = "500px")
+```
+
+These individidual visualizations help us understand how feature values for an individual data point contribute to the overall prediction. Here we see that The shot not coming from open play but rather from a penalty, as well as the closer distance of 11.8 yards, contributed strongly and positively to the predicted value. The only feature that decreased the predicted value, albeit slightly, is the shot being taken with the left foot. 
+
+## GLM Model
+
+For comparison, we also can look at the performance and predictions of a GLM model, and how they compare to the GBM model. The model training follows the same train/test split as the GBM Model, and adds in a few slight modifications to the features. 
+
+```{r train_glm}
+# convert NA's to values in order to input into the GLM model
+shots_modeling_glm <- shots_modeling %>%
+  mutate(pass.switch = ifelse(pass.switch == 0, 1, 0),
+         pass.switch = replace_na(pass.switch, 0),
+         pass.aerial_won = replace_na(pass.aerial_won, 0),
+         pass.through_ball = replace_na(pass.through_ball, 0),
+         pass.inswinging = replace_na(pass.inswinging, 0),
+         pass.straight = replace_na(pass.straight, 0),
+         pass.cross = replace_na(pass.cross, 0),
+         pass.outswinging = replace_na(pass.outswinging, 0),
+         pass.cut_back = replace_na(pass.cut_back, 0),
+         pass.deflected = replace_na(pass.deflected, 0),
+         pass.height.name = replace_na(pass.height.name, "No Pass"),
+         pass.body_part.name = replace_na(pass.body_part.name, "No Pass"),
+         pass.type.name = replace_na(pass.type.name, "No Pass"),
+         location_x_pass = replace_na(location_x_pass, 0),
+         location_y_pass = replace_na(location_y_pass, 0),
+         pass.length = replace_na(pass.length, 0),
+         pass.angle = replace_na(pass.angle, 0))
+
+shots_modeling_glm_label <- shots_modeling_glm %>%
+  select(label)
+
+# create train and test split
+shots_training_glm <- shots_modeling_glm[shots_index,]
+shots_test_glm <- shots_modeling_glm[-shots_index,]
+
+# build GLM model as a logistic regression
+xg_glm <- glm(label ~., data = shots_training_glm, family = "binomial")
+```
+
+#### Model Performance
+
+```{r auc_curve}
+# create full dataset without target for scoring predictions
+shots_modeling_glm_data <- shots_modeling_glm %>%
+  select(-label)
+
+# get full model scores
+glm_predictions <- as.data.frame(predict(xg_glm, shots_modeling_glm_data, type="response"))
+glm_predictions <- cbind(glm_predictions, shots_modeling_glm_label)
+glm_predictions <- glm_predictions %>%
+  mutate(prediction = `predict(xg_glm, shots_modeling_glm_data, type = "response")`) %>%
+  # 0.3 was determined to be the optimal cutoff value
+  mutate(predicted_value = as.factor(ifelse(prediction > 0.3, 1, 0)),
+         label = as.factor(label))
+
+# plot density distribution of xG
+ggplot(data = glm_predictions) + 
+  geom_density(aes(x = prediction), color = "black", fill = "grey", alpha = 0.5) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, .1)) + 
+  labs(title = "Density of xG Distributions",
+       subtitle = "Scores From All Shot Data",
+       x = "xG",
+       y = "Density") + 
+  theme_minimal()
+
+# create separate datasets for positive and negative predictions from the model
+glm_positives <- glm_predictions %>%
+  filter(predicted_value == 1)
+glm_negatives <- glm_predictions %>%
+  filter(predicted_value == 0)
+
+# convert binary label to interpretation for plotting
+glm_predictions <- glm_predictions %>%
+  mutate(pred_value = ifelse(label == 1, "Goal","No Goal"))
+
+# plot 
+ggplot() + 
+  geom_density(aes(x = prediction, group=pred_value, fill = pred_value), color = "black", alpha = 0.5, data = glm_predictions) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, .1)) + 
+  labs(title = "Density of xG Distributions",
+       subtitle = "Scores From All Shot Data",
+       x = "xG",
+       y = "Density") + 
+  theme_minimal()
+
+```
+
+As with the GBM Model, we can see that there is differentiation between predicted goals and not goals. The model associates the majority of non-goals with low xG values (<0.3), while associating higher xG values with goals, again showing us that the model is performing reasonably well at separating the two classes.
+
+#### ROC Curve
+
+```{r roc_curve}
+pROC_obj <- roc(glm_predictions$label, glm_predictions$prediction,
+            smoothed = TRUE,
+            # arguments for ci
+            ci=TRUE, ci.alpha=0.9, stratified=FALSE,
+            # arguments for plot
+            plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+            print.auc=TRUE, show.thres=TRUE)
+```
+
+The model performs approximately the same as the GBM when looking at the AUC value. Again AUC is a major metric for analyzing model performance, as the rank of predictions is relevant in this context.
+
+#### Confusion Matrix
+
+```{r confusion_matrix}
+# create confusion matrix
+confusionMatrix(as.factor(glm_predictions$predicted_value), as.factor(shots_modeling_glm_label$label), positive = '1')
+
+```
+
+Looking at the confusion matrix we see that using a cutoff of 0.3 provides the overall highest model accuracy. However with this cutoff value we have a slightly imbalanced specificity/sensitivity. While our specificity is high (the model performs well at identifying shots that are not goals), the sensitivity is low (the model performs worse at identifying shots that are goals). If we want to have a more balanced view between the sensitivity and specificity, we can lower the cutoff value from 0.3.
+
+## Feature Importance
+
+Feature importance in a logistic regression is more straightforward than in a GBM model. The first thing we will look at is the odds ratio, which is calculated by taking the exponent of the coefficients from the GLM model.
+
+```{r odds_ratio}
+# calculate odds ratio by taking exponent of coefficient
+xg_glm_coefs <- as.data.frame(xg_glm$coefficients)
+xg_glm_coefs <- xg_glm_coefs %>%
+  mutate(odds_ratio = exp(`xg_glm$coefficients`),
+         feature_name = row.names(xg_glm_coefs))
+
+# print out odds ratio labels
+xg_glm_coefs %>%
+  arrange(desc(odds_ratio)) %>%
+  kbl() %>%
+  kable_paper(fixed_thead = T) %>%
+  scroll_box(height = "500px")
+```
+
+We can see from the odds ratios that the highest values relate to the shot technique fields and pass body part fields. As these are categorical features, they are interpreted as the odds over the base feature left out of the model. For shot technique this is the 'backheel' level, and for the pass type it is 'Drop Kick' - both of these levels are not only rare but also have lower proportions of goals scored from them compared to other levels in the feature, which explains why the odds ratios for the features in the model are high.
+
+```{r pass_body_part}
+# show counts and goal proportions for levels of the pass body part feature 
+shots_modeling_glm %>%
+  group_by(pass.body_part.name) %>%
+  summarise(count = n(),
+            num_goals = sum(label)) %>%
+  mutate(goal_proportion = round(num_goals/count, 2)) %>%
+  kbl() %>%
+  kable_paper()
+```
+
+```{r shot_technique_name}
+# show counts and goal proportions for levels of the shot technique feature
+shots_modeling_glm %>%
+  group_by(shot.technique.name) %>%
+  summarise(count = n(),
+            num_goals = sum(label)) %>%
+  mutate(goal_proportion = round(num_goals/count, 2)) %>%
+  kbl() %>%
+  kable_paper()
+```
+
+From the GBM, the most predictive feature was the shot distance to the goal. Looking at the odds ratio for the feature in the GLM, we see that it has an odds ratio of 0.78. We can interpret this as for each increase of 1 yard in the shot distance (an increase in distance is further from the goal), we expect the goal probability to decrease by 32%, holding all other features in the model constant.
+
+```{r}
+xg_glm_coefs %>%
+  filter(feature_name == "shot_distance") %>%
+  kbl() %>%
+  kable_paper()
+```
+
+## Predicted Value Difference
+
+To understand how different the models are, we can join the two prediction datasets and look at the difference in predicted value. 
+
+```{r}
+# change names to identify predictions from each model
+predictions_only <- predictions %>%
+  rename("gbm_prediction" = "prediction") %>%
+  select(gbm_prediction)
+
+glm_predictions_only <- glm_predictions %>%
+  rename("glm_prediction" = "prediction") %>%
+  select(glm_prediction)
+
+# join sets together
+combined_set <- cbind(predictions_only, glm_predictions_only)
+
+# calculate difference in predicted value
+combined_set <- combined_set %>%
+  mutate(pred_value_diff = gbm_prediction - glm_prediction)
+
+# plot differences
+ggplot() + 
+  geom_histogram(aes(x = pred_value_diff), data = combined_set, binwidth = .05, fill = "black") + 
+  theme_minimal() + 
+  scale_x_continuous(breaks = seq(-1, 1, .1)) + 
+  labs(title = "Predicted xG Difference Between GBM and GLM",
+       x = "Predicted xG Difference",
+       y = "Count") + 
+  theme(panel.grid.minor.x = element_blank())
+
+# summarize the differences
+summary(combined_set$pred_value_diff)
+```
+
+Looking at the plot, the distribution of differences is largely centered between +- 0.15, meaning that most of the times the models are quite close on the predicted xG value. We see this also in the summary, as the IQR is from .006 to .04, meaning that the middle 50% of values are extremely close to one another. We can conclude from this that the models perform quite similar from a predicted value standpoint.
+
+## Summary
+
+#### Conclusion
+
+The purpose of this analysis was in large to demonstrate how an xG model can be constructed from existing data, and how we can use SHAP values to explain model performance. In summary, a model was built that performs relatively well (being evaluated on the AUC metric) and a few features have been analyzed using SHAP values that the model deems important to understand exactly how they work. There also was a comparison between GLM and GBM models conducted through comparison of feature importance and differences in predicted values. In summary, we have multiple models that are able to predict xG well, and we understand what they use to generate predictions.
+
+#### Takeaways
+
+First, I was surprised at the performance of the GLM compared to the GBM - as modeling expected goals is likely a problem that is more non-linear in nature and involves interactions, the GLM was able to produce a similar AUC result as the GBM, and there are relatively small differences in predicted values between the two models. 
+
+I was also surprised at the strong impact of creating the shot_distance feature - while I assumed that this feature would be important given the context of the modeling problem, I didn't expect to have such a large impact. 
+
+The major takeaways is that we now have multiple models that can be used as predictors for xG, and we have an understanding of why they work well and what they use to generate predictions. 
+
+#### Session Info
+
+For results replication and transparency, here is the session info used at the time of analysis:
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
